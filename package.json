@@ -1,0 +1,1 @@
+{"name":"ship.fun","version":"0.0.0","private":true,"packageManager":"pnpm@10.33.0","scripts":{"dev":"pnpm --parallel --filter @shipfun/web --filter @shipfun/api dev","build":"pnpm -r build","test":"pnpm -r test","typecheck":"pnpm -r typecheck"}}

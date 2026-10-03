@@ -1,0 +1,83 @@
+diff --git a/cmd/subnet.go b/cmd/subnet.go
+index a63dc05..e3623d2 100644
+--- a/cmd/subnet.go
++++ b/cmd/subnet.go
+@@ -225,11 +225,15 @@ var subnetConvertL1Cmd = &cobra.Command{
+ 			return fmt.Errorf("failed to create wallet: %w", err)
+ 		}
+ 		defer cleanup()
++		if err := setConversionValidatorOwners(validators, w.PChainAddress()); err != nil {
++			return err
++		}
+ 
+ 		fmt.Println("Converting subnet to L1...")
+ 		fmt.Printf("  Subnet ID: %s\n", sid)
+ 		fmt.Printf("  Chain ID: %s\n", cid)
+ 		fmt.Printf("  Validators: %d\n", len(validators))
++		fmt.Printf("  Validator balance/deactivation owner: %s\n", w.FormattedPChainAddress())
+ 		fmt.Println("Submitting transaction...")
+ 
+ 		txID, err := pchain.ConvertSubnetToL1(ctx, w, sid, cid, managerAddr, validators)
+diff --git a/cmd/validators_spec.go b/cmd/validators_spec.go
+index 7106f60..f58b3af 100644
+--- a/cmd/validators_spec.go
++++ b/cmd/validators_spec.go
+@@ -27,6 +27,25 @@ import (
+ 
+ const defaultValidatorWeight uint64 = 100
+ 
++// setConversionValidatorOwners keeps the remaining balance and the right to
++// deactivate each initial L1 validator under the P-Chain wallet that signs the
++// conversion. Both fields are otherwise left empty by the upstream CLI.
++func setConversionValidatorOwners(validators []*txs.ConvertSubnetToL1Validator, owner ids.ShortID) error {
++	if owner == (ids.ShortID{}) {
++		return fmt.Errorf("conversion validator owner must not be empty")
++	}
++	for i, validator := range validators {
++		if validator == nil {
++			return fmt.Errorf("conversion validator %d is nil", i)
++		}
++		validator.RemainingBalanceOwner.Threshold = 1
++		validator.RemainingBalanceOwner.Addresses = []ids.ShortID{owner}
++		validator.DeactivationOwner.Threshold = 1
++		validator.DeactivationOwner.Addresses = []ids.ShortID{owner}
++	}
++	return nil
++}
++
+ // gatherL1Validators queries validator nodes and builds conversion validators.
+ // If weights is non-nil, it must have the same length as validatorAddrs.
+ func gatherL1Validators(ctx context.Context, validatorAddrs []string, balance float64, weights []uint64) ([]*txs.ConvertSubnetToL1Validator, error) {
+diff --git a/cmd/validators_spec_test.go b/cmd/validators_spec_test.go
+index 1f5bb35..918ed5f 100644
+--- a/cmd/validators_spec_test.go
++++ b/cmd/validators_spec_test.go
+@@ -29,6 +29,28 @@ func newTestPoP(t *testing.T) *signer.ProofOfPossession {
+ 	return pop
+ }
+ 
++func TestSetConversionValidatorOwners(t *testing.T) {
++	owner := ids.GenerateTestShortID()
++	validators := []*txs.ConvertSubnetToL1Validator{{}, {}}
++	if err := setConversionValidatorOwners(validators, owner); err != nil {
++		t.Fatal(err)
++	}
++	for i, validator := range validators {
++		if validator.RemainingBalanceOwner.Threshold != 1 || !reflect.DeepEqual(validator.RemainingBalanceOwner.Addresses, []ids.ShortID{owner}) {
++			t.Fatalf("validator %d remaining balance owner is not the signer", i)
++		}
++		if validator.DeactivationOwner.Threshold != 1 || !reflect.DeepEqual(validator.DeactivationOwner.Addresses, []ids.ShortID{owner}) {
++			t.Fatalf("validator %d deactivation owner is not the signer", i)
++		}
++	}
++	if err := setConversionValidatorOwners(validators, ids.ShortID{}); err == nil {
++		t.Fatal("expected empty owner to fail")
++	}
++	if err := setConversionValidatorOwners([]*txs.ConvertSubnetToL1Validator{nil}, owner); err == nil {
++		t.Fatal("expected nil validator to fail")
++	}
++}
++
+ func TestParseValidatorAddrs(t *testing.T) {
+ 	got := parseValidatorAddrs(" 127.0.0.1 , node.example.com:9650 ,,https://node.example.com ")
+ 	want := []string{"127.0.0.1", "node.example.com:9650", "https://node.example.com"}

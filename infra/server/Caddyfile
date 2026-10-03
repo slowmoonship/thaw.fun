@@ -1,0 +1,6 @@
+thaw.fun {
+  encode zstd gzip
+  reverse_proxy /api/* api:3000
+  reverse_proxy web:80
+}
+# Avalanche RPC is intentionally not exposed. Add only reviewed HTTPS routes.
