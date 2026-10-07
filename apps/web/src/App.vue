@@ -147,8 +147,16 @@ async function copyValue(label: string, value?: string | number) {
   } catch { copied.value = ""; }
 }
 
+function clearFujiCreateLatch() {
+  fujiCreateStarted.value = false;
+  submittedFujiChainId.value = "";
+  try { window.localStorage.removeItem("thaw-fuji-create-attempt-started"); } catch { /* Storage may be unavailable. */ }
+}
+
 function resetToBirth() {
-  chain.value = undefined; error.value = "";
+  if (chain.value?.network === "fuji") clearFujiCreateLatch();
+  chain.value = undefined;
+  error.value = "";
   if (poll) window.clearInterval(poll);
   poll = undefined;
 }
@@ -164,7 +172,12 @@ onMounted(async () => {
     const active = newestFirst.find((item) => ["CREATING", "LIVE", "EXPIRING"].includes(item.status));
     const blocked = newestFirst.find((item) => item.status === "FAILED" && item.requiresRecovery);
     const latestDead = newestFirst.find((item) => item.status === "DEAD");
-    const restored = environment.value.network === "fuji" ? newestFirst[0] : active ?? blocked ?? latestDead;
+    const restored = active ?? blocked ?? (environment.value.network === "local" ? latestDead : undefined);
+
+    // A completed Fuji lifecycle is history, not an active session.
+    // Once no active/recovery record remains, a fresh visit starts at Birth.
+    if (environment.value.network === "fuji" && !active && !blocked) clearFujiCreateLatch();
+
     if (restored) {
       chain.value = restored;
       if (["CREATING", "LIVE", "EXPIRING"].includes(restored.status)) startPolling(restored.id);
@@ -250,7 +263,7 @@ onUnmounted(() => { if (poll) window.clearInterval(poll); });
         <div class="api-truth"><span>API STATE</span><strong>{{ chain?.status }}</strong><small v-if="chain?.status === 'EXPIRING'">{{ chain.network === 'fuji' ? isExpiring ? 'Cleanup request sent. Check the operator terminal for a signing prompt.' : fujiCleanupMessage : 'Termination is running. Waiting for the API.' }}</small></div>
         <button v-if="chain?.status === 'LIVE' && (chain.network === 'local' || (chain.network === 'fuji' && fujiMutationEnabled))" class="danger" type="button" :disabled="isExpiring" @click="expireNow">{{ isExpiring ? "TERMINATING…" : "TERMINATE EARLY" }}</button>
         <button v-else-if="chain?.status === 'EXPIRING' && chain.network === 'fuji' && fujiMutationEnabled && chain.canContinueExpiration" class="danger" type="button" :disabled="isExpiring" @click="expireNow">{{ isExpiring ? "CLEANUP REQUESTED…" : "CONTINUE CLEANUP" }}</button>
-        <button v-else-if="phase === 'DEAD' && chain?.network === 'local'" class="secondary" type="button" @click="resetToBirth">CREATE ANOTHER</button>
+        <button v-else-if="phase === 'DEAD' && (chain?.network === 'local' || chain?.network === 'fuji')" class="secondary" type="button" @click="resetToBirth">CREATE ANOTHER</button>
       </div>
     </section>
     <aside v-if="error" class="error-panel" role="alert"><span>EXCEPTION</span><strong>{{ error }}</strong></aside>

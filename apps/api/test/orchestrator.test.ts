@@ -160,22 +160,29 @@ test("concurrent Fuji create calls serialize preflight and preserve the one-shot
   const second = orchestrator.create({ name: "TWO", symbol: "TWO", lifetimeSeconds: 60 });
   releasePreflight.resolve();
   const created = await first;
-  await assert.rejects(() => second, hasCode("FUJI_SINGLE_CREATE_ATTEMPT_USED"));
+  await assert.rejects(() => second, hasCode("ACTIVE_CHAIN_EXISTS"));
   await orchestrator.waitForIdle(created.id);
   assert.equal(adapter.preflights, 1);
   assert.equal(repository.chains.length, 1);
   orchestrator.close();
 });
 
-test("Fuji repository permits only one create attempt even after DEAD", async () => {
+test("Fuji permits a sequential create after the previous L1 is DEAD", async () => {
   const repository = new MemoryRepository();
   const orchestrator = new L1Orchestrator(repository, new FakeAdapter(), { network: "fuji" });
-  const created = await orchestrator.create({ name: "FUJI", symbol: "FUJI", lifetimeSeconds: 60 });
-  await orchestrator.waitForIdle(created.id);
-  await orchestrator.expire(created.id);
-  assert.equal((await repository.findById(created.id))?.status, "DEAD");
-  await assert.rejects(() => orchestrator.create({ name: "SECOND", symbol: "SECOND", lifetimeSeconds: 60 }), hasCode("FUJI_SINGLE_CREATE_ATTEMPT_USED"));
-  assert.equal(repository.chains.length, 1);
+
+  const first = await orchestrator.create({ name: "FIRST", symbol: "FIRST", lifetimeSeconds: 60 });
+  await orchestrator.waitForIdle(first.id);
+  await orchestrator.expire(first.id);
+
+  assert.equal((await repository.findById(first.id))?.status, "DEAD");
+
+  const second = await orchestrator.create({ name: "SECOND", symbol: "SECOND", lifetimeSeconds: 60 });
+  await orchestrator.waitForIdle(second.id);
+
+  assert.equal((await repository.findById(second.id))?.status, "LIVE");
+  assert.equal(repository.chains.length, 2);
+
   orchestrator.close();
 });
 
@@ -358,7 +365,7 @@ test("unresolved expiration cleanup remains FAILED and recovery-blocking", async
   const failed = await repository.findById("live");
   assert.equal(failed?.status, "FAILED");
   assert.equal(failed?.requiresRecovery, true);
-  await assert.rejects(() => orchestrator.create({ name: "TWO", symbol: "TWO", lifetimeSeconds: 60 }), hasCode("FUJI_SINGLE_CREATE_ATTEMPT_USED"));
+  await assert.rejects(() => orchestrator.create({ name: "TWO", symbol: "TWO", lifetimeSeconds: 60 }), hasCode("ACTIVE_CHAIN_EXISTS"));
   orchestrator.close();
 });
 

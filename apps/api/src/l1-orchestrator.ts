@@ -62,9 +62,6 @@ export class L1Orchestrator {
     await previous;
     try {
       const records = await this.repository.list();
-      if (this.network === "fuji" && records.length > 0) {
-        throw new AppError("FUJI_SINGLE_CREATE_ATTEMPT_USED", "Fuji repository already contains its one permitted chain attempt", 409);
-      }
       if (records.some((chain) => ACTIVE.has(chain.status) || chain.requiresRecovery)) {
         throw new AppError("ACTIVE_CHAIN_EXISTS", "only one active disposable L1 is allowed", 409);
       }
