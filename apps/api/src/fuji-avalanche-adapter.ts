@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { access, readFile, realpath, stat } from "node:fs/promises";
-import { connect, isIP } from "node:net";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CommandRunnerLike } from "./command-runner.js";
@@ -15,9 +15,8 @@ import { FoundryFujiManagerBootstrap } from "./fuji-manager-bootstrap.js";
 
 const BLOCK_PROBE_RECIPIENT = "0x1111111111111111111111111111111111111111";
 const DEFAULT_P_CHAIN_RPC = "https://api.avax-test.network/ext/P";
-// darwin/arm64 build of the pinned v2.0.1 CLI with both conversion owner fields
-// explicitly set to the signing P-Chain address. Never fall back to upstream.
-const OWNER_SAFE_PLATFORM_CLI_SHA256 = "c6e4c3fe5cea038b8ecd207cafe57a9c2f466b008957e652854bbd119ad654ba";
+// Exact reviewed Linux Platform CLI v2.3.0 binary used by the Fuji VPS.
+const OWNER_SAFE_PLATFORM_CLI_SHA256 = "3cef834c5dea608a09c4d62b0c3c1135b3b7b43af25e9c93dc97b835d659bece";
 
 export interface FujiNodeIdentity {
   nodeId: string;
@@ -59,6 +58,7 @@ interface RpcClient {
 
 export interface FujiAdapterOptions {
   platformCliExecutable?: string;
+  platformPasswordFile?: string;
   castExecutable?: string;
   keyName?: string;
   genesisPath?: string;
@@ -163,6 +163,7 @@ export class CommandFujiHostingController implements FujiHostingController {
 export class FujiAvalancheAdapter implements AvalancheAdapter {
   private readonly preflightTokens = new WeakSet<FujiCreatePreparation>();
   private readonly platformCli: string;
+  private readonly platformPasswordFile: string;
   private readonly cast: string;
   private readonly keyName: string;
   private readonly genesisPath: string;
@@ -179,6 +180,8 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
   private readonly probeKeystore: string;
   private readonly probeAddress: string;
   private readonly interactiveSigning: boolean;
+  private readonly managerBootstrapEnabled: boolean;
+  private readonly blockProbeEnabled: boolean;
   private readonly validatorBalanceAvax: number;
   private readonly runner: CommandRunnerLike;
   private readonly hosting: FujiHostingController;
@@ -198,6 +201,7 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
 
   constructor(options: FujiAdapterOptions = {}) {
     this.platformCli = options.platformCliExecutable ?? process.env.PLATFORM_CLI_PATH ?? "platform-cli";
+    this.platformPasswordFile = options.platformPasswordFile ?? process.env.SHIPFUN_FUJI_PLATFORM_PASSWORD_FILE ?? "";
     this.cast = options.castExecutable ?? process.env.CAST_PATH ?? join(homedir(), ".foundry", "bin", "cast");
     this.keyName = options.keyName ?? process.env.SHIPFUN_FUJI_KEY_NAME ?? "";
     this.genesisPath = options.genesisPath ?? process.env.SHIPFUN_FUJI_GENESIS_PATH ?? "";
@@ -214,7 +218,10 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
     this.probeKeystore = options.probeKeystorePath ?? process.env.SHIPFUN_FUJI_PROBE_KEYSTORE ?? "";
     this.probeAddress = options.probeAddress ?? process.env.SHIPFUN_FUJI_PROBE_ADDRESS ?? "";
     this.interactiveSigning = options.interactiveSigning ?? process.env.SHIPFUN_FUJI_INTERACTIVE_SIGNING === "true";
-    this.validatorBalanceAvax = options.validatorBalanceAvax ?? 1;
+    this.managerBootstrapEnabled = process.env.SHIPFUN_FUJI_MANAGER_BOOTSTRAP_ENABLED !== "false";
+    this.blockProbeEnabled = process.env.SHIPFUN_FUJI_BLOCK_PROBE_ENABLED !== "false";
+    this.validatorBalanceAvax = options.validatorBalanceAvax
+      ?? Number(process.env.SHIPFUN_FUJI_VALIDATOR_BALANCE_AVAX ?? "1");
     this.runner = options.runner ?? new CommandRunner();
     this.rpc = options.rpc ?? { call: rpcCall };
     this.hosting = options.hosting ?? new CommandFujiHostingController(process.env.SHIPFUN_FUJI_HOST_CONTROL_EXECUTABLE, this.runner);
@@ -245,13 +252,24 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
     });
     this.readFujiWalletAddress = options.readFujiWalletAddress ?? (async () => {
       const result = await this.runner.run(this.platformCli, ["wallet", "address", "--network", "fuji", "--key-name", this.keyName], {
-        timeoutMs: 60_000, stdin: "inherit", operatorPasswordPrompt: true, redactFailureOutput: true, env: safeSignerEnvironment(),
+        timeoutMs: 60_000,
+        stdin: this.interactiveSigning ? "inherit" : "ignore",
+        operatorPasswordPrompt: this.interactiveSigning,
+        redactFailureOutput: true,
+        env: await this.platformSignerEnvironment(),
       });
       const address = result.stdout.match(/P-Chain Address:\s*(P-fuji1[0-9a-z]+)/)?.[1];
       if (!address) throw new Error("Fuji wallet address was not returned by Platform CLI");
       return address;
     });
-    this.rpcReachable = options.rpcReachable ?? tcpReachable;
+    this.rpcReachable = options.rpcReachable ?? (async (url) => {
+      try {
+        await this.rpc.call(url, "eth_chainId");
+        return true;
+      } catch {
+        return false;
+      }
+    });
     this.hasTty = options.hasTty ?? (Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY));
     this.inspectProbeFiles = options.inspectProbeFiles ?? inspectProbeFiles;
     this.verifyPlatformCli = options.verifyPlatformCli ?? (async () => {
@@ -312,6 +330,8 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
         "--validator-bls-pops", node.blsProofOfPossession,
         "--validator-balance", String(this.validatorBalanceAvax),
         "--validator-weights", "100",
+        "--validator-remaining-balance-owner", this.pChainAddress,
+        "--validator-deactivation-owner", this.pChainAddress,
       ], 300_000);
       await record("convert_to_l1", "accepted", parseOptionalTxId(conversion.stdout));
       partial.validatorId = parseOptionalLabeledId(conversion.stdout, "Validation ID")
@@ -321,27 +341,36 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
       const deployment = requireDeployment(partial);
       await this.hosting.prepare(chain, deployment);
       await this.waitForExpectedRpc(deployment.rpcUrl, chain.evmChainId);
-      await this.managerBootstrap!.initialize(chain, deployment, node, record, checkpoint);
-      const before = await this.blockNumber(deployment.rpcUrl);
-      await record("block_probe", "pending");
-      const probe = await this.runner.run(this.cast, [
-        "send", BLOCK_PROBE_RECIPIENT, "--value", "1wei",
-        "--keystore", this.probeKeystore,
-        "--rpc-url", deployment.rpcUrl, "--json",
-      ], { timeoutMs: 120_000, stdin: "inherit", operatorPasswordPrompt: true, redactFailureOutput: true, env: safeSignerEnvironment() });
-      const receipt = parseProbeReceipt(probe.stdout);
-      partial.probeTxHash = receipt.hash;
-      partial.probeReceiptBlock = receipt.block;
-      partial.probeBlockBefore = before;
-      await checkpoint?.({ ...partial, fujiJournal: [...journal] });
-      await record("block_probe", "accepted", receipt.hash);
-      const after = await this.blockNumber(deployment.rpcUrl);
-      if (after <= before) throw new Error(`transaction was confirmed without block growth (${before} -> ${after})`);
-      partial.probeBlockAfter = after;
-      await checkpoint?.({ ...partial, fujiJournal: [...journal] });
-      await record("block_probe", "verified", receipt.hash);
+      if (this.managerBootstrapEnabled) {
+        if (!this.managerBootstrap) throw new Error("FUJI_MANAGER_BOOTSTRAP_NOT_CONFIGURED");
+        await this.managerBootstrap.initialize(chain, deployment, node, record, checkpoint);
+      }
+
+      let latestBlock = await this.blockNumber(deployment.rpcUrl);
+
+      if (this.blockProbeEnabled) {
+        const before = latestBlock;
+        await record("block_probe", "pending");
+        const probe = await this.runner.run(this.cast, [
+          "send", BLOCK_PROBE_RECIPIENT, "--value", "1wei",
+          "--keystore", this.probeKeystore,
+          "--rpc-url", deployment.rpcUrl, "--json",
+        ], { timeoutMs: 120_000, stdin: "inherit", operatorPasswordPrompt: true, redactFailureOutput: true, env: safeSignerEnvironment() });
+        const receipt = parseProbeReceipt(probe.stdout);
+        partial.probeTxHash = receipt.hash;
+        partial.probeReceiptBlock = receipt.block;
+        partial.probeBlockBefore = before;
+        await checkpoint?.({ ...partial, fujiJournal: [...journal] });
+        await record("block_probe", "accepted", receipt.hash);
+        latestBlock = await this.blockNumber(deployment.rpcUrl);
+        if (latestBlock <= before) throw new Error(`transaction was confirmed without block growth (${before} -> ${latestBlock})`);
+        partial.probeBlockAfter = latestBlock;
+        await checkpoint?.({ ...partial, fujiJournal: [...journal] });
+        await record("block_probe", "verified", receipt.hash);
+      }
+
       this.logger.info({ chainId: chain.id, internalName: chain.internalName, operation: "fuji_create", status: "LIVE" }, "Fuji L1 is live");
-      return { ...deployment, latestBlock: after };
+      return { ...deployment, latestBlock };
     } catch (error) {
       throw new PartialFujiDeploymentError(sanitizeFailure(error), partial);
     }
@@ -402,19 +431,41 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
   private async preflight(chain: DisposableChain): Promise<FujiCreatePreparation> {
     await this.hosting.assertCreateReady();
     await this.preflightSigningOnly(this.conversionDeposit());
-    if (!this.genesisPath || !this.genesisManifestPath || !this.officialGenesisSourcePath) throw new Error("reviewed Fuji genesis template, manifest, and pinned official source are required");
+
+    if (!this.genesisPath || !this.genesisManifestPath) {
+      throw new Error("reviewed Fuji genesis template and manifest are required");
+    }
     if (!/^0x[0-9a-fA-F]{40}$/.test(this.manager)) throw new Error("valid Fuji validator manager address is required");
     if (!this.nodeAddress) throw new Error("SHIPFUN_FUJI_NODE_ADDRESS is required");
     if (!/^https?:\/\//.test(this.rpcBaseUrl)) throw new Error("valid SHIPFUN_FUJI_RPC_BASE_URL is required");
-    if (!this.probeKeystore || !/^0x[0-9a-fA-F]{40}$/.test(this.probeAddress)) throw new Error("encrypted Fuji probe identity is required");
-    for (const path of [this.genesisPath, this.genesisManifestPath, this.officialGenesisSourcePath, this.probeKeystore]) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(this.probeAddress)) throw new Error("valid Fuji probe address is required");
+
+    const paths = [this.genesisPath, this.genesisManifestPath];
+    if (this.officialGenesisSourcePath) paths.push(this.officialGenesisSourcePath);
+
+    const needsEvmSigner = this.managerBootstrapEnabled || this.blockProbeEnabled;
+    if (needsEvmSigner) {
+      if (!this.probeKeystore) throw new Error("encrypted Fuji probe keystore is required");
+      paths.push(this.probeKeystore);
+    }
+
+    for (const path of paths) {
       if (!isAbsolute(path)) throw new Error("Fuji artifact paths must be absolute");
       await this.accessFile(path);
     }
-    await this.inspectProbeFiles(this.probeKeystore);
-    if ((await this.readProbeAddress()).toLowerCase() !== this.probeAddress.toLowerCase()) throw new Error("Fuji probe keystore address mismatch");
-    if (!this.managerBootstrap) throw new Error("FUJI_MANAGER_BOOTSTRAP_NOT_CONFIGURED");
-    await this.managerBootstrap.assertReady();
+
+    if (needsEvmSigner) {
+      await this.inspectProbeFiles(this.probeKeystore);
+      if ((await this.readProbeAddress()).toLowerCase() !== this.probeAddress.toLowerCase()) {
+        throw new Error("Fuji probe keystore address mismatch");
+      }
+    }
+
+    if (this.managerBootstrapEnabled) {
+      if (!this.managerBootstrap) throw new Error("FUJI_MANAGER_BOOTSTRAP_NOT_CONFIGURED");
+      await this.managerBootstrap.assertReady();
+    }
+
     const node = await this.readNodeIdentity();
     await this.hosting.assertCreateReady();
     const preparedGenesis = await this.prepareGenesis(chain, {
@@ -430,8 +481,11 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
 
   private async preflightSigningOnly(deposit = 0n): Promise<void> {
     if (!this.keyName) throw new Error("SHIPFUN_FUJI_KEY_NAME is required");
-    if (!this.interactiveSigning) throw new Error("FUJI_INTERACTIVE_SIGNING_REQUIRED");
-    if (!this.hasTty) throw new Error("FUJI_OPERATOR_TTY_REQUIRED");
+    if (this.interactiveSigning) {
+      if (!this.hasTty) throw new Error("FUJI_OPERATOR_TTY_REQUIRED");
+    } else {
+      await this.platformSignerEnvironment();
+    }
     await this.verifyPlatformCli();
     if (!/^P-fuji1[0-9a-z]+$/.test(this.pChainAddress) || !this.maxPChainGasPriceNAvax || !this.minPChainBalanceNAvax) {
       throw new Error("FUJI_EXPLICIT_P_CHAIN_BUDGET_REQUIRED");
@@ -450,12 +504,39 @@ export class FujiAvalancheAdapter implements AvalancheAdapter {
     };
   }
 
+  private async platformSignerEnvironment(): Promise<NodeJS.ProcessEnv> {
+    if (this.interactiveSigning) return safeSignerEnvironment();
+
+    if (!this.platformPasswordFile || !isAbsolute(this.platformPasswordFile)) {
+      throw new Error("FUJI_PLATFORM_PASSWORD_FILE_REQUIRED");
+    }
+
+    const metadata = await stat(this.platformPasswordFile);
+    if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) {
+      throw new Error("Fuji Platform CLI password file must be owner-only");
+    }
+
+    const raw = await readFile(this.platformPasswordFile, "utf8");
+    const password = raw.replace(/\r?\n$/, "");
+    if (password.length < 8) throw new Error("Fuji Platform CLI password is invalid");
+
+    const env = safeSignerEnvironment();
+    env.PLATFORM_CLI_KEY_PASSWORD = password;
+    return env;
+  }
+
   private async runSigned(args: readonly string[], timeoutMs = 180_000) {
     await this.verifyPlatformCli();
     const deposit = args[0] === "subnet" && args[1] === "convert-to-l1"
       ? this.conversionDeposit() : 0n;
     await this.assertPChainBudget(deposit);
-    return this.runner.run(this.platformCli, [...args, "--network", "fuji", "--key-name", this.keyName], { timeoutMs, stdin: "inherit", operatorPasswordPrompt: true, redactFailureOutput: true, env: safeSignerEnvironment() });
+    return this.runner.run(this.platformCli, [...args, "--network", "fuji", "--key-name", this.keyName], {
+      timeoutMs,
+      stdin: this.interactiveSigning ? "inherit" : "ignore",
+      operatorPasswordPrompt: this.interactiveSigning,
+      redactFailureOutput: true,
+      env: await this.platformSignerEnvironment(),
+    });
   }
 
   private conversionDeposit(): bigint {
@@ -569,19 +650,6 @@ function commandOutput(error: unknown): string {
 function isAlreadyDisabled(error: unknown): boolean {
   const output = commandOutput(error);
   return output.includes("already disabled") || output.includes("validator is disabled") || output.includes("inactive validator");
-}
-
-function tcpReachable(url: string): Promise<boolean> {
-  const endpoint = new URL(url);
-  if (!["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) throw new Error("Fuji RPC offline check requires localhost");
-  const port = Number(endpoint.port || (endpoint.protocol === "https:" ? "443" : "80"));
-  return new Promise((resolve) => {
-    const socket = connect({ host: endpoint.hostname.replace(/^\[|\]$/g, ""), port });
-    socket.setTimeout(2_000);
-    socket.once("connect", () => { socket.destroy(); resolve(true); });
-    socket.once("error", () => { socket.destroy(); resolve(false); });
-    socket.once("timeout", () => { socket.destroy(); resolve(true); });
-  });
 }
 
 export async function inspectProbeFiles(keystore: string): Promise<void> {

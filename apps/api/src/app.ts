@@ -34,20 +34,31 @@ export function repositoryPathFor(network: ChainNetwork): string {
   return process.env.CHAIN_REPOSITORY_PATH ?? resolve(process.cwd(), ".runtime", "chains.json");
 }
 
-const FUJI_BROWSER_ORIGIN = "http://127.0.0.1:5173";
-const FUJI_BROWSER_HOSTS = new Set(["127.0.0.1:5173", "127.0.0.1:3000"]);
+function fujiWriteOrigins(): Set<string> {
+  const configured = process.env.SHIPFUN_FUJI_WRITE_ORIGINS ?? "http://127.0.0.1:5173";
+  return new Set(
+    configured
+      .split(",")
+      .map((value) => value.trim().replace(/\/$/, ""))
+      .filter(Boolean),
+  );
+}
 
 export function isFujiBrowserWriteRequest(headers: { origin?: string; host?: string }): boolean {
-  return headers.origin === FUJI_BROWSER_ORIGIN && FUJI_BROWSER_HOSTS.has(headers.host ?? "");
+  const origin = headers.origin?.replace(/\/$/, "");
+  return Boolean(origin && fujiWriteOrigins().has(origin));
 }
 
 export const buildApp = async (options: BuildAppOptions = {}) => {
   const app = Fastify({ logger: true });
   const network = options.network ?? configuredNetwork();
+  const interactiveFujiSigning = process.env.SHIPFUN_FUJI_INTERACTIVE_SIGNING === "true"
+    && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const automatedFujiSigner = Boolean(process.env.SHIPFUN_FUJI_PLATFORM_PASSWORD_FILE)
+    && await available([process.env.SHIPFUN_FUJI_PLATFORM_PASSWORD_FILE!]);
   const fujiMutationEnabled = network === "fuji"
     && process.env.SHIPFUN_FUJI_MUTATION_APPROVED === "true"
-    && process.env.SHIPFUN_FUJI_INTERACTIVE_SIGNING === "true"
-    && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    && (interactiveFujiSigning || automatedFujiSigner);
   const assertFujiWriteAccess = (headers: { origin?: string; host?: string }) => {
     if (network !== "fuji") return;
     if (!fujiMutationEnabled) throw new AppError("FUJI_MUTATION_NOT_APPROVED", "Fuji mutation gate is closed", 403);

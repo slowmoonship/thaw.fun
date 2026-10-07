@@ -83,6 +83,34 @@ test("explicit Fuji orchestration persists network fuji", async () => {
   orchestrator.close();
 });
 
+test("Fuji scheduler automatically expires while the API process remains running", async () => {
+  const repository = new MemoryRepository();
+  const adapter = new FakeAdapter();
+  const orchestrator = new L1Orchestrator(repository, adapter, {
+    network: "fuji",
+    idFactory: () => "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+  });
+
+  const created = await orchestrator.create({
+    name: "FUJI",
+    symbol: "FUJI",
+    lifetimeSeconds: 0.02,
+  });
+
+  await orchestrator.waitForIdle(created.id);
+  assert.equal((await repository.findById(created.id))?.status, "LIVE");
+
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await orchestrator.waitForIdle(created.id);
+
+  const dead = await repository.findById(created.id);
+  assert.equal(dead?.status, "DEAD");
+  assert.equal(dead?.requiresRecovery, false);
+  assert.equal(adapter.expired, 1);
+
+  orchestrator.close();
+});
+
 test("Fuji preflight failure leaves no one-shot record and permits a later attempt", async () => {
   class PreflightAdapter extends FakeAdapter {
     calls = 0;
@@ -345,6 +373,7 @@ test("Fuji restart during EXPIRING retains recovery without automatic signing", 
   await restarted.expire("live");
   assert.equal(adapter.expired, 1);
   assert.equal((await repository.findById("live"))?.status, "DEAD");
+  assert.equal((await repository.findById("live"))?.requiresRecovery, false);
   restarted.close();
 });
 

@@ -204,10 +204,10 @@ test("checkpoints accepted Fuji resource IDs before the next external mutation",
   assert.equal(checkpoints.at(-1)?.probeBlockAfter, 11);
 });
 
-test("configuration failure happens before the mutation marker", async () => {
+test("non-interactive signing requires a protected Platform CLI password file before mutation", async () => {
   const { adapter } = harness({ interactiveSigning: false });
   let marked = false;
-  await assert.rejects(() => adapter.createL1(chain(), async () => { marked = true; }), /INTERACTIVE_SIGNING_REQUIRED/);
+  await assert.rejects(() => adapter.createL1(chain(), async () => { marked = true; }), /FUJI_PLATFORM_PASSWORD_FILE_REQUIRED/);
   assert.equal(marked, false);
 });
 

@@ -41,10 +41,48 @@ test("GET /environment reports the selected Fuji network", async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-test("Fuji browser writes require the exact loopback UI origin and host", () => {
-  assert.equal(isFujiBrowserWriteRequest({ origin: "http://127.0.0.1:5173", host: "127.0.0.1:5173" }), true);
-  assert.equal(isFujiBrowserWriteRequest({ origin: "http://127.0.0.1:5173", host: "127.0.0.1:3000" }), true);
-  assert.equal(isFujiBrowserWriteRequest({ host: "127.0.0.1:3000" }), false);
-  assert.equal(isFujiBrowserWriteRequest({ origin: "https://other.example", host: "127.0.0.1:3000" }), false);
-  assert.equal(isFujiBrowserWriteRequest({ origin: "http://127.0.0.1:5173", host: "other.example" }), false);
+test("Fuji browser writes require an explicitly approved UI origin", () => {
+  const previous = process.env.SHIPFUN_FUJI_WRITE_ORIGINS;
+
+  try {
+    process.env.SHIPFUN_FUJI_WRITE_ORIGINS =
+      "http://127.0.0.1:5173,https://thaw.slowmoonship.com";
+
+    assert.equal(
+      isFujiBrowserWriteRequest({
+        origin: "http://127.0.0.1:5173",
+        host: "127.0.0.1:5173",
+      }),
+      true,
+    );
+
+    assert.equal(
+      isFujiBrowserWriteRequest({
+        origin: "https://thaw.slowmoonship.com",
+        host: "thaw.slowmoonship.com",
+      }),
+      true,
+    );
+
+    assert.equal(
+      isFujiBrowserWriteRequest({
+        host: "thaw.slowmoonship.com",
+      }),
+      false,
+    );
+
+    assert.equal(
+      isFujiBrowserWriteRequest({
+        origin: "https://other.example",
+        host: "thaw.slowmoonship.com",
+      }),
+      false,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.SHIPFUN_FUJI_WRITE_ORIGINS;
+    } else {
+      process.env.SHIPFUN_FUJI_WRITE_ORIGINS = previous;
+    }
+  }
 });

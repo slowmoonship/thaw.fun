@@ -197,6 +197,8 @@ export class L1Orchestrator {
       });
       assertTransition(chain.status, "DEAD");
       chain.status = "DEAD";
+      chain.requiresRecovery = false;
+      delete chain.failureReason;
       chain.expiredAt = this.now().toISOString();
       await this.repository.update(chain);
       this.logger.info({ chainId: chain.id, internalName: chain.internalName, operation: "expire", status: "DEAD" }, "L1 is dead");
@@ -215,12 +217,12 @@ export class L1Orchestrator {
     if (!chain.expiresAt) throw new Error("LIVE chain has no expiresAt");
     const delay = Math.max(0, Date.parse(chain.expiresAt) - this.now().getTime());
     const timer = setTimeout(() => {
-      if (this.network === "fuji") {
-        void this.markManualExpiration(chain.id).catch((error) => {
-          this.logger.error({ chainId: chain.id, operation: "fuji_manual_expiry", error: sanitizeFailure(error) }, "Could not persist Fuji expiry handoff");
-        });
-      }
-      else this.startExpiration(chain.id);
+      void this.startExpiration(chain.id).catch((error) => {
+        this.logger.error(
+          { chainId: chain.id, operation: "scheduled_expiry", error: sanitizeFailure(error) },
+          "Scheduled expiration failed",
+        );
+      });
     }, delay);
     timer.unref();
     this.timers.set(chain.id, timer);
